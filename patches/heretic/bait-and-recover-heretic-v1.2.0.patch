@@ -1,0 +1,835 @@
+diff --git a/README.md b/README.md
+index b07825e..434185b 100644
+--- a/README.md
++++ b/README.md
+@@ -2,6 +2,8 @@
+ 
+ # Heretic: Fully automatic censorship removal for language models<br><br>[![Discord](https://img.shields.io/discord/1447831134212984903?color=5865F2&label=discord&labelColor=black&logo=discord&logoColor=white&style=for-the-badge)](https://discord.gg/gdXc48gSyT) [![Follow us on Hugging Face](https://huggingface.co/datasets/huggingface/badges/resolve/main/follow-us-on-hf-md-dark.svg)](https://huggingface.co/heretic-org)
+ 
++[![#1 Repository of the Day](https://trendshift.io/api/badge/repositories/20538)](https://trendshift.io/repositories/20538)
++
+ Heretic is a tool that removes censorship (aka "safety alignment") from
+ transformer-based language models without expensive post-training.
+ It combines an advanced implementation of directional ablation, also known
+diff --git a/config.default.toml b/config.default.toml
+index abfa0fc..2c14b6c 100644
+--- a/config.default.toml
++++ b/config.default.toml
+@@ -1,6 +1,16 @@
+ # Rename this file to config.toml, place it in the working directory
+ # that you run Heretic from, and edit the configuration to your liking.
+ 
++# Exit after optimization instead of opening the interactive trial-selection menu.
++# Useful for batch runs and shell pipelines.
++exit_after_optimization = false
++
++# Random seed for Optuna's TPE sampler. Set this for reproducible searches.
++# sampler_seed = 42
++
++# Print timing breakdowns for each optimization trial.
++print_timing = false
++
+ # List of PyTorch dtypes to try when loading model tensors.
+ # If loading with a dtype fails, the next dtype in the list will be tried.
+ dtypes = [
+diff --git a/pyproject.toml b/pyproject.toml
+index 5779e49..17854fc 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -22,19 +22,19 @@ classifiers = [
+     "Programming Language :: Python :: 3.12",
+ ]
+ dependencies = [
+-    "accelerate~=1.10",
+-    "bitsandbytes~=0.45",
+-    "datasets~=4.0",
++    "accelerate~=1.13",
++    "bitsandbytes~=0.49",
++    "datasets~=4.7",
+     "hf-transfer~=0.1",
+-    "huggingface-hub~=0.34",
+-    "kernels~=0.11",
+-    "optuna~=4.5",
+-    "peft~=0.14",
+-    "psutil~=7.1",
+-    "pydantic-settings~=2.10",
++    "huggingface-hub~=1.7",
++    "kernels~=0.12",
++    "optuna~=4.7",
++    "peft~=0.18",
++    "psutil~=7.2",
++    "pydantic-settings~=2.13",
+     "questionary~=2.1",
+-    "rich~=14.1",
+-    "transformers~=4.57",
++    "rich~=14.3",
++    "transformers~=5.3",
+ ]
+ 
+ [project.optional-dependencies]
+diff --git a/src/heretic/config.py b/src/heretic/config.py
+index 8ed3f80..2aee2d5 100644
+--- a/src/heretic/config.py
++++ b/src/heretic/config.py
+@@ -26,6 +26,12 @@ class RowNormalization(str, Enum):
+     FULL = "full"
+ 
+ 
++class DirectionScope(str, Enum):
++    BOTH = "both"
++    GLOBAL = "global"
++    PER_LAYER = "per-layer"
++
++
+ class DatasetSpecification(BaseModel):
+     dataset: str = Field(
+         description="Hugging Face dataset ID, or path to dataset on disk."
+@@ -72,6 +78,24 @@ class Settings(BaseSettings):
+         ),
+     )
+ 
++    exit_after_optimization: bool = Field(
++        default=False,
++        description=(
++            "Exit after optimization completes instead of opening the interactive "
++            "trial-selection menu. Useful for batch runs and shell pipelines."
++        ),
++    )
++
++    resume_skip_incomplete_trials: bool = Field(
++        default=False,
++        description=(
++            "When resuming a journal checkpoint, mark stale RUNNING/WAITING "
++            "trials from an interrupted process as failed before continuing. "
++            "This preserves completed trials and lets batch runs top up to the "
++            "requested number of completed trials."
++        ),
++    )
++
+     dtypes: list[str] = Field(
+         default=[
+             # In practice, "auto" almost always means bfloat16.
+@@ -135,6 +159,11 @@ class Settings(BaseSettings):
+         description="Whether to print prompt/response pairs when counting refusals.",
+     )
+ 
++    print_timing: bool = Field(
++        default=False,
++        description="Whether to print timing breakdowns for each optimization trial.",
++    )
++
+     print_residual_geometry: bool = Field(
+         default=False,
+         description="Whether to print detailed information about residuals and refusal directions.",
+@@ -215,6 +244,15 @@ class Settings(BaseSettings):
+         ),
+     )
+ 
++    direction_scope: DirectionScope = Field(
++        default=DirectionScope.BOTH,
++        description=(
++            "Which refusal-direction scope to optimize. 'both' searches the original "
++            "mixed Heretic space, 'global' uses one interpolated refusal direction "
++            "for all layers, and 'per-layer' uses each layer's own refusal direction."
++        ),
++    )
++
+     n_trials: int = Field(
+         default=200,
+         description="Number of abliteration trials to run during optimization.",
+@@ -225,6 +263,14 @@ class Settings(BaseSettings):
+         description="Number of trials that use random sampling for the purpose of exploration.",
+     )
+ 
++    sampler_seed: int | None = Field(
++        default=None,
++        description=(
++            "Random seed for Optuna's TPE sampler. Set this for reproducible "
++            "trial suggestions across comparable Heretic runs."
++        ),
++    )
++
+     study_checkpoint_dir: str = Field(
+         default="checkpoints",
+         description="Directory to save and load study progress to/from.",
+diff --git a/src/heretic/evaluator.py b/src/heretic/evaluator.py
+index f2a8a25..4991294 100644
+--- a/src/heretic/evaluator.py
++++ b/src/heretic/evaluator.py
+@@ -1,6 +1,8 @@
+ # SPDX-License-Identifier: AGPL-3.0-or-later
+ # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
+ 
++import time
++
+ import torch.nn.functional as F
+ from torch import Tensor
+ 
+@@ -16,10 +18,12 @@ class Evaluator:
+     bad_prompts: list[Prompt]
+     base_logprobs: Tensor
+     base_refusals: int
++    last_timing: dict[str, float]
+ 
+     def __init__(self, settings: Settings, model: Model):
+         self.settings = settings
+         self.model = model
++        self.last_timing = {}
+ 
+         print()
+         print(
+@@ -93,24 +97,36 @@ class Evaluator:
+         return refusal_count
+ 
+     def get_score(self) -> tuple[tuple[float, float], float, int]:
++        timing: dict[str, float] = {}
++
+         print("  * Obtaining first-token probability distributions...")
++        start = time.perf_counter()
+         logprobs = self.model.get_logprobs_batched(self.good_prompts)
++        timing["kl_logprobs"] = time.perf_counter() - start
++
++        start = time.perf_counter()
+         kl_divergence = F.kl_div(
+             logprobs,
+             self.base_logprobs,
+             reduction="batchmean",
+             log_target=True,
+         ).item()
++        timing["kl_compute"] = time.perf_counter() - start
+         print(f"  * KL divergence: [bold]{kl_divergence:.4f}[/]")
+ 
+         print("  * Counting model refusals...")
++        start = time.perf_counter()
+         refusals = self.count_refusals()
++        timing["refusal_count"] = time.perf_counter() - start
+         print(f"  * Refusals: [bold]{refusals}[/]/{len(self.bad_prompts)}")
++        self.last_timing = timing
+ 
+         kl_divergence_scale = self.settings.kl_divergence_scale
+         kl_divergence_target = self.settings.kl_divergence_target
+ 
+-        refusals_score = refusals / self.base_refusals
++        refusals_score = (
++            refusals / self.base_refusals if self.base_refusals > 0 else float(refusals)
++        )
+ 
+         if kl_divergence >= kl_divergence_target:
+             kld_score = kl_divergence / kl_divergence_scale
+diff --git a/src/heretic/main.py b/src/heretic/main.py
+index 50befc7..ea818f9 100644
+--- a/src/heretic/main.py
++++ b/src/heretic/main.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: AGPL-3.0-or-later
+ # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
+ 
++import hashlib
+ import math
+ import os
+ import sys
+@@ -36,7 +37,7 @@ from questionary import Choice
+ from rich.traceback import install
+ 
+ from .analyzer import Analyzer
+-from .config import QuantizationMethod, Settings
++from .config import DirectionScope, QuantizationMethod, Settings
+ from .evaluator import Evaluator
+ from .model import AbliterationParameters, Model, get_model_class
+ from .utils import (
+@@ -174,9 +175,15 @@ def run():
+     # Adapted from https://github.com/huggingface/accelerate/blob/main/src/accelerate/commands/env.py
+     if torch.cuda.is_available():
+         count = torch.cuda.device_count()
+-        print(f"Detected [bold]{count}[/] CUDA device(s):")
++        total_vram = sum(torch.cuda.mem_get_info(i)[1] for i in range(count))
++        print(
++            f"Detected [bold]{count}[/] CUDA device(s) ({total_vram / (1024**3):.2f} GB total VRAM):"
++        )
+         for i in range(count):
+-            print(f"* GPU {i}: [bold]{torch.cuda.get_device_name(i)}[/]")
++            vram = torch.cuda.mem_get_info(i)[1] / (1024**3)
++            print(
++                f"* GPU {i}: [bold]{torch.cuda.get_device_name(i)}[/] ({vram:.2f} GB)"
++            )
+     elif is_xpu_available():
+         count = torch.xpu.device_count()
+         print(f"Detected [bold]{count}[/] XPU device(s):")
+@@ -228,12 +235,19 @@ def run():
+ 
+     os.makedirs(settings.study_checkpoint_dir, exist_ok=True)
+ 
++    model_id = "".join(
++        [(c if (c.isalnum() or c in ["_", "-"]) else "--") for c in settings.model]
++    )
++
++    if len(model_id) > 200:
++        # Use a hash to keep the filename within limits while maintaining uniqueness.
++        model_id = (
++            model_id[:128] + "--" + hashlib.sha256(settings.model.encode()).hexdigest()[:16]
++        )
++
+     study_checkpoint_file = os.path.join(
+         settings.study_checkpoint_dir,
+-        "".join(
+-            [(c if (c.isalnum() or c in ["_", "-"]) else "--") for c in settings.model]
+-        )
+-        + ".jsonl",
++        model_id + ".jsonl",
+     )
+ 
+     lock_obj = JournalFileOpenLock(study_checkpoint_file)
+@@ -248,7 +262,7 @@ def run():
+     if existing_study is not None and settings.evaluate_model is None:
+         choices = []
+ 
+-        if existing_study.user_attrs["finished"]:
++        if existing_study.user_attrs.get("finished", False):
+             print()
+             print(
+                 (
+@@ -296,12 +310,31 @@ def run():
+         )
+ 
+         print()
+-        choice = prompt_select("How would you like to proceed?", choices)
++        if settings.exit_after_optimization:
++            print(
++                "[green]Non-interactive mode enabled; continuing from the existing checkpoint.[/]"
++            )
++            choice = "continue"
++        else:
++            choice = prompt_select("How would you like to proceed?", choices)
+ 
+         if choice == "continue":
+-            settings = Settings.model_validate_json(
+-                existing_study.user_attrs["settings"]
+-            )
++            exit_after_optimization = settings.exit_after_optimization
++            sampler_seed = settings.sampler_seed
++            print_timing = settings.print_timing
++            resume_skip_incomplete_trials = settings.resume_skip_incomplete_trials
++            if "settings" in existing_study.user_attrs:
++                settings = Settings.model_validate_json(
++                    existing_study.user_attrs["settings"]
++                )
++                settings.exit_after_optimization = exit_after_optimization
++                settings.sampler_seed = sampler_seed
++                settings.print_timing = print_timing
++                settings.resume_skip_incomplete_trials = resume_skip_incomplete_trials
++            else:
++                print(
++                    "[yellow]Existing checkpoint has no saved settings yet; using current settings.[/]"
++                )
+         elif choice == "restart":
+             os.unlink(study_checkpoint_file)
+             backend = JournalFileBackend(study_checkpoint_file, lock_obj=lock_obj)
+@@ -371,7 +404,8 @@ def run():
+ 
+     print()
+     print("Checking for common response prefix...")
+-    responses = model.get_responses_batched(good_prompts[:100] + bad_prompts[:100])
++    prefix_check_prompts = good_prompts[:100] + bad_prompts[:100]
++    responses = model.get_responses_batched(prefix_check_prompts)
+ 
+     # Despite being located in os.path, commonprefix actually performs
+     # a naive string operation without any path-specific logic,
+@@ -382,24 +416,39 @@ def run():
+     model.response_prefix = commonprefix(responses).rstrip(" ")
+ 
+     # Suppress CoT output.
+-    if model.response_prefix.startswith("<think>"):
+-        # Most thinking models.
+-        model.response_prefix = "<think></think>"
+-    elif model.response_prefix.startswith("<|channel|>analysis<|message|>"):
+-        # gpt-oss.
+-        model.response_prefix = "<|channel|>analysis<|message|><|end|><|start|>assistant<|channel|>final<|message|>"
+-    elif model.response_prefix.startswith("<thought>"):
+-        # Unknown, suggested by user.
+-        model.response_prefix = "<thought></thought>"
+-    elif model.response_prefix.startswith("[THINK]"):
+-        # Unknown, suggested by user.
+-        model.response_prefix = "[THINK][/THINK]"
++    recheck_prefix = False
++    if model.response_prefix:
++        # When using any of the predefined prefixes below, we need to check that
++        # the prefix is actually complete (e.g. not missing a trailing newline).
++        recheck_prefix = True
++        if model.response_prefix.startswith("<think>"):
++            # Most thinking models.
++            model.response_prefix = "<think></think>"
++        elif model.response_prefix.startswith("<|channel|>analysis<|message|>"):
++            # gpt-oss.
++            model.response_prefix = "<|channel|>analysis<|message|><|end|><|start|>assistant<|channel|>final<|message|>"
++        elif model.response_prefix.startswith("<thought>"):
++            # Unknown, suggested by user.
++            model.response_prefix = "<thought></thought>"
++        elif model.response_prefix.startswith("[THINK]"):
++            # Unknown, suggested by user.
++            model.response_prefix = "[THINK][/THINK]"
++        else:
++            recheck_prefix = False
+ 
+     if model.response_prefix:
+         print(f"* Prefix found: [bold]{model.response_prefix!r}[/]")
+     else:
+         print("* None found")
+ 
++    if recheck_prefix:
++        print("* Rechecking with prefix...")
++        responses = model.get_responses_batched(prefix_check_prompts)
++        additional_prefix = commonprefix(responses).rstrip(" ")
++        if additional_prefix:
++            model.response_prefix += additional_prefix
++            print(f"* Extended prefix found: [bold]{model.response_prefix!r}[/]")
++
+     evaluator = Evaluator(settings, model)
+ 
+     if settings.evaluate_model is not None:
+@@ -455,13 +504,19 @@ def run():
+         trial_index += 1
+         trial.set_user_attr("index", trial_index)
+ 
+-        direction_scope = trial.suggest_categorical(
+-            "direction_scope",
+-            [
+-                "global",
+-                "per layer",
+-            ],
+-        )
++        if settings.direction_scope == DirectionScope.BOTH:
++            direction_scope = trial.suggest_categorical(
++                "direction_scope",
++                [
++                    "global",
++                    "per layer",
++                ],
++            )
++        elif settings.direction_scope == DirectionScope.GLOBAL:
++            direction_scope = "global"
++        else:
++            direction_scope = "per layer"
++        trial.set_user_attr("direction_scope", direction_scope)
+ 
+         last_layer_index = len(model.get_layers()) - 1
+ 
+@@ -469,14 +524,17 @@ def run():
+         # in layers slightly past the midpoint of the layer stack. See the original
+         # abliteration paper (https://arxiv.org/abs/2406.11717) for a deeper analysis.
+         #
+-        # Note that we always sample this parameter even though we only need it for
+-        # the "global" direction scope. The reason is that multivariate TPE doesn't
+-        # work with conditional or variable-range parameters.
+-        direction_index = trial.suggest_float(
+-            "direction_index",
+-            0.4 * last_layer_index,
+-            0.9 * last_layer_index,
+-        )
++        # In the original mixed search, always sample this parameter even though
++        # only global trials use it. Multivariate TPE handles a fixed search
++        # space better than conditional parameters.
++        if settings.direction_scope != DirectionScope.PER_LAYER:
++            direction_index = trial.suggest_float(
++                "direction_index",
++                0.4 * last_layer_index,
++                0.9 * last_layer_index,
++            )
++        else:
++            direction_index = None
+ 
+         if direction_scope == "per layer":
+             direction_index = None
+@@ -528,12 +586,32 @@ def run():
+         print("* Parameters:")
+         for name, value in get_trial_parameters(trial).items():
+             print(f"  * {name} = [bold]{value}[/]")
++
++        trial_start = time.perf_counter()
+         print("* Resetting model...")
++        start = time.perf_counter()
+         model.reset_model()
++        reset_seconds = time.perf_counter() - start
++
+         print("* Abliterating...")
++        start = time.perf_counter()
+         model.abliterate(refusal_directions, direction_index, parameters)
++        abliterate_seconds = time.perf_counter() - start
++
+         print("* Evaluating...")
++        start = time.perf_counter()
+         score, kl_divergence, refusals = evaluator.get_score()
++        evaluate_seconds = time.perf_counter() - start
++        trial_seconds = time.perf_counter() - trial_start
++
++        if settings.print_timing:
++            print("  * Timing:")
++            print(f"    * reset_model: [bold]{reset_seconds:.2f}s[/]")
++            print(f"    * abliterate: [bold]{abliterate_seconds:.2f}s[/]")
++            print(f"    * evaluate_total: [bold]{evaluate_seconds:.2f}s[/]")
++            for name, seconds in evaluator.last_timing.items():
++                print(f"    * {name}: [bold]{seconds:.2f}s[/]")
++            print(f"    * trial_total: [bold]{trial_seconds:.2f}s[/]")
+ 
+         elapsed_time = time.perf_counter() - start_time
+         remaining_time = (elapsed_time / (trial_index - start_index)) * (
+@@ -565,6 +643,7 @@ def run():
+             n_startup_trials=settings.n_startup_trials,
+             n_ei_candidates=128,
+             multivariate=True,
++            seed=settings.sampler_seed,
+         ),
+         directions=[StudyDirection.MINIMIZE, StudyDirection.MINIMIZE],
+         storage=storage,
+@@ -575,9 +654,33 @@ def run():
+     study.set_user_attr("settings", settings.model_dump_json())
+     study.set_user_attr("finished", False)
+ 
++    def count_trials_with_states(states: set[TrialState]) -> int:
++        return sum(1 for trial in study.trials if trial.state in states)
++
+     def count_completed_trials() -> int:
+-        # Count number of complete trials to compute trials to run.
+-        return sum([(1 if t.state == TrialState.COMPLETE else 0) for t in study.trials])
++        return count_trials_with_states({TrialState.COMPLETE})
++
++    def count_live_trials() -> int:
++        return count_trials_with_states({TrialState.COMPLETE, TrialState.RUNNING, TrialState.WAITING})
++
++    if settings.resume_skip_incomplete_trials:
++        stale_trials = [
++            trial
++            for trial in study.trials
++            if trial.state in {TrialState.RUNNING, TrialState.WAITING}
++        ]
++        if stale_trials:
++            print()
++            print(
++                "[yellow]Skipping "
++                f"{len(stale_trials)} stale incomplete trial(s) from the existing journal "
++                "before resuming.[/]"
++            )
++            for stale_trial in stale_trials:
++                study._storage.set_trial_state_values(
++                    stale_trial._trial_id,
++                    TrialState.FAIL,
++                )
+ 
+     start_index = trial_index = count_completed_trials()
+     if start_index > 0:
+@@ -585,10 +688,14 @@ def run():
+         print("Resuming existing study.")
+ 
+     try:
+-        study.optimize(
+-            objective_wrapper,
+-            n_trials=settings.n_trials - count_completed_trials(),
+-        )
++        while count_completed_trials() < settings.n_trials:
++            # Run one trial at a time so multiple worker processes sharing the same
++            # JournalStorage converge on a global n_trials budget instead of each
++            # worker independently running n_trials.
++            if count_live_trials() >= settings.n_trials:
++                time.sleep(2)
++                continue
++            study.optimize(objective_wrapper, n_trials=1)
+     except KeyboardInterrupt:
+         # This additional handler takes care of the small chance that KeyboardInterrupt
+         # is raised just between trials, which wouldn't be caught by the handler
+@@ -662,6 +769,13 @@ def run():
+             )
+         )
+ 
++        if settings.exit_after_optimization:
++            print()
++            print(
++                "[green]Non-interactive mode enabled; exiting without trial selection.[/]"
++            )
++            return
++
+         while True:
+             print()
+             trial = prompt_select("Which trial do you want to use?", choices)
+@@ -823,11 +937,23 @@ def run():
+                                     token=token,
+                                 )
+ 
+-                            # If the model path doesn't exist locally, it can be assumed
+-                            # to be a model hosted on the Hugging Face Hub, in which case
++                            # If the model path exists locally and includes the
++                            # card, use it directly. If the model path doesn't
++                            # exist locally, it can be assumed to be a model
++                            # hosted on the Hugging Face Hub, in which case
+                             # we can retrieve the model card.
+-                            if not Path(settings.model).exists():
++                            model_path = Path(settings.model)
++                            if model_path.exists():
++                                card_path = (
++                                    model_path / huggingface_hub.constants.REPOCARD_NAME
++                                )
++                                if card_path.exists():
++                                    card = ModelCard.load(card_path)
++                                else:
++                                    card = None
++                            else:
+                                 card = ModelCard.load(settings.model)
++                            if card is not None:
+                                 if card.data is None:
+                                     card.data = ModelCardData()
+                                 if card.data.tags is None:
+diff --git a/src/heretic/model.py b/src/heretic/model.py
+index 58300b1..a7ff017 100644
+--- a/src/heretic/model.py
++++ b/src/heretic/model.py
+@@ -151,24 +151,43 @@ class Model:
+ 
+         print(f"* Transformer model with [bold]{len(self.get_layers())}[/] layers")
+         print("* Abliterable components:")
+-        for component, modules in self.get_layer_modules(0).items():
+-            print(
+-                f"  * [bold]{component}[/]: [bold]{len(modules)}[/] modules per layer"
+-            )
++        all_components = {}
++        for layer_index in range(len(self.get_layers())):
++            for component, modules in self.get_layer_modules(layer_index).items():
++                if component not in all_components:
++                    all_components[component] = 0
++                all_components[component] += len(modules)
++        for component, count in all_components.items():
++            print(f"  * [bold]{component}[/]: [bold]{count}[/] modules total")
+ 
+     def _apply_lora(self):
+         # Guard against calling this method at the wrong time.
+         assert isinstance(self.model, PreTrainedModel)
+ 
+         # Always use LoRA adapters for abliteration (faster reload, no weight modification).
+-        # We use the leaf names (e.g. "o_proj") as target modules.
+-        # This may cause LoRA adapters to be attached to unrelated modules (e.g. "conv.o_proj"),
+-        # but this is harmless as we only abliterate the modules we target in `abliterate()`,
+-        # leaving the others at their default (identity) state.
+-        # NOTE: This will need to be updated when hybrid layer support (#43) is merged.
+-        target_modules = [
+-            comp.split(".")[-1] for comp in self.get_abliterable_components()
+-        ]
++        # Collect actual leaf module names from the model for LoRA targeting.
++        # This is more robust than splitting component keys (e.g. "attn.o_proj" -> "o_proj")
++        # because hybrid models like Qwen3.5 MoE have modules with different names
++        # across layers (e.g. "o_proj" on attention layers, "out_proj" on linear attention layers).
++        target_modules_set: set[str] = set()
++
++        for layer_index, layer in enumerate(self.get_layers()):
++            module_id_to_lora_target = {}
++            for module_name, module in layer.named_modules():
++                if module_name.endswith(".linear"):
++                    # Gemma 4 exposes projections through Gemma4ClippableLinear
++                    # wrappers. PEFT cannot wrap the outer module, but it can
++                    # wrap the inner torch.nn.Linear at e.g. o_proj.linear.
++                    module_id_to_lora_target[id(module)] = module_name
++                else:
++                    module_id_to_lora_target[id(module)] = module_name.split(".")[-1]
++
++            for modules in self.get_layer_modules(layer_index).values():
++                for module in modules:
++                    if id(module) in module_id_to_lora_target:
++                        target_modules_set.add(module_id_to_lora_target[id(module)])
++
++        target_modules = sorted(target_modules_set)
+ 
+         if self.settings.row_normalization != RowNormalization.FULL:
+             # Rank 1 is sufficient for directional ablation without renormalization.
+@@ -331,6 +350,9 @@ class Model:
+         def try_add(component: str, module: Any):
+             # Only add if it's a proper nn.Module (PEFT can wrap these with LoRA)
+             if isinstance(module, Module):
++                inner_linear = getattr(module, "linear", None)
++                if isinstance(inner_linear, Module) and not hasattr(module, "weight"):
++                    module = inner_linear
+                 if component not in modules:
+                     modules[component] = []
+                 modules[component].append(module)
+@@ -340,9 +362,20 @@ class Model:
+                     f"Unexpected Tensor in {component} - expected nn.Module"
+                 )
+ 
+-        # Exceptions aren't suppressed here, because there is currently
+-        # no alternative location for the attention out-projection.
+-        try_add("attn.o_proj", layer.self_attn.o_proj)  # ty:ignore[possibly-missing-attribute]
++        # Standard self-attention out-projection (most models).
++        with suppress(Exception):
++            try_add("attn.o_proj", layer.self_attn.o_proj)  # ty:ignore[possibly-missing-attribute]
++
++        # Spark-X2.5 uses ``out_proj`` for the same standard attention output
++        # projection. Keep reporting the canonical Heretic component name so
++        # the attack search space remains identical across architectures.
++        with suppress(Exception):
++            try_add("attn.o_proj", layer.self_attn.out_proj)  # ty:ignore[possibly-missing-attribute]
++
++        # Qwen3.5 MoE hybrid layers use GatedDeltaNet (linear attention) instead
++        # of standard self-attention, so self_attn.o_proj doesn't exist on those layers.
++        with suppress(Exception):
++            try_add("attn.o_proj", layer.linear_attn.out_proj)  # ty:ignore[possibly-missing-attribute]
+ 
+         # Most dense models.
+         with suppress(Exception):
+@@ -374,7 +407,12 @@ class Model:
+         return modules
+ 
+     def get_abliterable_components(self) -> list[str]:
+-        return list(self.get_layer_modules(0).keys())
++        # Scan all layers because hybrid models (e.g. Qwen3.5 MoE) have different
++        # components on different layers (some have self_attn, others linear_attn).
++        components: set[str] = set()
++        for layer_index in range(len(self.get_layers())):
++            components.update(self.get_layer_modules(layer_index).keys())
++        return sorted(components)
+ 
+     def abliterate(
+         self,
+@@ -603,12 +641,37 @@ class Model:
+     def get_residuals(self, prompts: list[Prompt]) -> Tensor:
+         # We only generate one token, and we return the residual vectors
+         # at that token position, for each prompt and layer.
+-        _, outputs = self.generate(
+-            prompts,
+-            max_new_tokens=1,
+-            output_hidden_states=True,
+-            return_dict_in_generate=True,
++        layers = self.get_layers()
++        hooked_residuals: list[Tensor | None] = [None] * (len(layers) + 1)
++        handles = []
++
++        def capture_embedding(_module, args):
++            if hooked_residuals[0] is None and args and isinstance(args[0], Tensor):
++                hooked_residuals[0] = args[0][:, -1, :].detach()
++
++        def capture_layer(layer_position: int):
++            def hook(_module, _args, output):
++                tensor = output[0] if isinstance(output, (tuple, list)) else output
++                if hooked_residuals[layer_position] is None and isinstance(tensor, Tensor):
++                    hooked_residuals[layer_position] = tensor[:, -1, :].detach()
++
++            return hook
++
++        handles.append(layers[0].register_forward_pre_hook(capture_embedding))
++        handles.extend(
++            layer.register_forward_hook(capture_layer(layer_idx + 1))
++            for layer_idx, layer in enumerate(layers)
+         )
++        try:
++            _, outputs = self.generate(
++                prompts,
++                max_new_tokens=1,
++                output_hidden_states=True,
++                return_dict_in_generate=True,
++            )
++        finally:
++            for handle in handles:
++                handle.remove()
+ 
+         # This cast is valid because GenerateDecoderOnlyOutput is the return type
+         # of model.generate with return_dict_in_generate=True.
+@@ -616,16 +679,21 @@ class Model:
+ 
+         # Hidden states for the first (only) generated token.
+         # This cast is valid because we passed output_hidden_states=True above.
+-        hidden_states = cast(tuple[tuple[FloatTensor]], outputs.hidden_states)[0]
+-
+-        # The returned tensor has shape (prompt, layer, component).
+-        residuals = torch.stack(
+-            # layer_hidden_states has shape (prompt, position, component),
+-            # so this extracts the hidden states at the end of each prompt,
+-            # and stacks them up over the layers.
+-            [layer_hidden_states[:, -1, :] for layer_hidden_states in hidden_states],
+-            dim=1,
+-        )
++        native_hidden_states = outputs.hidden_states[0] if outputs.hidden_states else None
++        if native_hidden_states is not None:
++            hidden_states = cast(tuple[FloatTensor], native_hidden_states)
++            residuals = torch.stack(
++                [layer_hidden_states[:, -1, :] for layer_hidden_states in hidden_states],
++                dim=1,
++            )
++        else:
++            missing = [idx for idx, value in enumerate(hooked_residuals) if value is None]
++            if missing:
++                raise RuntimeError(f"Residual hook capture missed positions: {missing}")
++            residuals = torch.stack(
++                [value for value in hooked_residuals if value is not None],
++                dim=1,
++            )
+ 
+         # Upcast the data type to avoid precision (bfloat16) or range (float16)
+         # problems during calculations involving residual vectors.
+@@ -719,7 +787,12 @@ class Model:
+             max_new_tokens=4096,
+         )  # ty:ignore[call-non-callable]
+ 
+-        return self.tokenizer.decode(
+-            outputs[0, inputs["input_ids"].shape[1] :],
+-            skip_special_tokens=True,
++        # This cast is valid because str is the return type
++        # when passing a sequence of token IDs.
++        return cast(
++            str,
++            self.tokenizer.decode(
++                outputs[0, inputs["input_ids"].shape[1] :],
++                skip_special_tokens=True,
++            ),
+         )
+diff --git a/src/heretic/utils.py b/src/heretic/utils.py
+index e706c5c..4256270 100644
+--- a/src/heretic/utils.py
++++ b/src/heretic/utils.py
+@@ -38,11 +38,17 @@ def print_memory_usage():
+     p("Resident system RAM", Process().memory_info().rss)
+ 
+     if torch.cuda.is_available():
+-        p("Allocated GPU VRAM", torch.cuda.memory_allocated())
+-        p("Reserved GPU VRAM", torch.cuda.memory_reserved())
++        count = torch.cuda.device_count()
++        allocated = sum(torch.cuda.memory_allocated(device) for device in range(count))
++        reserved = sum(torch.cuda.memory_reserved(device) for device in range(count))
++        p("Allocated GPU VRAM", allocated)
++        p("Reserved GPU VRAM", reserved)
+     elif is_xpu_available():
+-        p("Allocated XPU memory", torch.xpu.memory_allocated())
+-        p("Reserved XPU memory", torch.xpu.memory_reserved())
++        count = torch.xpu.device_count()
++        allocated = sum(torch.xpu.memory_allocated(device) for device in range(count))
++        reserved = sum(torch.xpu.memory_reserved(device) for device in range(count))
++        p("Allocated XPU memory", allocated)
++        p("Reserved XPU memory", reserved)
+     elif torch.backends.mps.is_available():
+         p("Allocated MPS memory", torch.mps.current_allocated_memory())
+         p("Driver (reserved) MPS memory", torch.mps.driver_allocated_memory())
+@@ -167,7 +173,9 @@ def load_prompts(
+     path = specification.dataset
+     split_str = specification.split
+ 
+-    if os.path.isdir(path):
++    if os.path.isfile(path):
++        dataset = load_dataset("json", data_files=path, split=split_str)
++    elif os.path.isdir(path):
+         if Path(path, DATASET_STATE_JSON_FILENAME).exists():
+             # Dataset saved with datasets.save_to_disk; needs special handling.
+             # Path should be the subdirectory for a particular split.
+@@ -253,6 +261,7 @@ def empty_cache():
+ def get_trial_parameters(trial: Trial) -> dict[str, str]:
+     params = {}
+ 
++    params["direction_scope"] = str(trial.user_attrs.get("direction_scope", "mixed"))
+     direction_index = trial.user_attrs["direction_index"]
+     params["direction_index"] = (
+         "per layer" if (direction_index is None) else f"{direction_index:.2f}"
+@@ -271,7 +280,11 @@ def get_readme_intro(
+     base_refusals: int,
+     bad_prompts: list[Prompt],
+ ) -> str:
+-    model_link = f"[{settings.model}](https://huggingface.co/{settings.model})"
++    if Path(settings.model).exists():
++        # Hide the path, which may contain private information.
++        model_link = "a model"
++    else:
++        model_link = f"[{settings.model}](https://huggingface.co/{settings.model})"
+ 
+     return f"""# This is a decensored version of {
+         model_link

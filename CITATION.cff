@@ -1,0 +1,39 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the associated Bait-and-Recover paper."
+title: "Bait-and-Recover"
+type: software
+version: 0.1.0
+date-released: 2026-09-09
+license: AGPL-3.0-or-later
+authors:
+  - family-names: Gao
+    given-names: Tian
+  - family-names: Xie
+    given-names: Zhipeng
+  - family-names: Wu
+    given-names: Yuhao
+  - family-names: Liu
+    given-names: Junhua
+  - family-names: Fang
+    given-names: Xin
+repository-code: "https://github.com/SparkShieldLab/bait-and-recover"
+abstract: "Research code for checkpoint-level hardening against low-distortion refusal-direction editing."
+preferred-citation:
+  type: conference-paper
+  title: "Bait-and-Recover: Poisoning Internal Refusal Signals to Defend LLMs against White-Box Editing Jailbreaks"
+  authors:
+    - family-names: Gao
+      given-names: Tian
+    - family-names: Xie
+      given-names: Zhipeng
+    - family-names: Wu
+      given-names: Yuhao
+    - family-names: Liu
+      given-names: Junhua
+    - family-names: Fang
+      given-names: Xin
+  year: 2026
+  conference:
+    name: "AACL-IJCNLP 2026"
+  url: "https://arxiv.org/abs/2609.05794"
+  notes: "Accepted to AACL-IJCNLP 2026 Main; arXiv:2609.05794; final proceedings metadata forthcoming."

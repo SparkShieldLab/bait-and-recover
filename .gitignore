@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environments
+.env
+.venv/
+venv/
+
+# Large runtime outputs
+artifacts/
+experiments/sidechannel_suite/results/models/
+experiments/sidechannel_suite/results/**/*.safetensors
+experiments/sidechannel_suite/results/**/*.bin
+experiments/sidechannel_suite/heretic_checkpoints/
+experiments/sidechannel_suite/logs/
+experiments/sidechannel_suite/data/
+
+# External dependencies prepared by scripts/setup_heretic.sh
+external/
+
+# Model checkpoints are published separately, not committed to git.
+checkpoints/
+models/
